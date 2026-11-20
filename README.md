@@ -1,11 +1,11 @@
 # opteryx-upload
 
 Client for the [Opteryx Upload Service](https://github.com/mabel-dev/upload.opteryx):
-a Python SDK, a command line, and a full-screen terminal app.
+a Python SDK, a command line, a full-screen terminal app, and a GitHub Action.
 
-All three do the same four things in the same order, because a difference
-between them is a place where the thing you tested by hand is not the thing CI
-does. **Negotiate** — send a few megabytes of sample and agree what the data
+All of them do the same four things in the same order - the action runs the
+command line, which runs the SDK - because a difference between them is a place
+where the thing you tested by hand is not the thing CI does. **Negotiate** — send a few megabytes of sample and agree what the data
 will become. **Look** at the plan. **Accept** it. Then **upload and commit**.
 
 Nothing is sent until that is settled, so an upload that was going to be refused
@@ -121,6 +121,8 @@ retrying a broken service often does.
 | `-y`, `--yes` | accept inferred types unasked; required off a terminal |
 | `-m`, `--message` | snapshot message |
 | `--json` | the contract as the service sent it |
+| `--output-json PATH` | write the contract there as well, keeping the readable output |
+| `--oidc` | authenticate as this GitHub Actions workflow; no secret needed |
 | `--no-color` | never colour the output |
 
 ### Credentials
@@ -134,8 +136,130 @@ in gigabytes finish.
 valid one. An access token in the environment wins over it, and `--token` wins
 over both.
 
+In GitHub Actions there is a third option and it is the best one, because
+there is nothing to store: with `permissions: id-token: write` on the job and
+no other credential set, the workflow authenticates as itself. `--oidc` demands
+that rather than allowing it, so a job that meant to prove who it is fails
+instead of quietly falling back to an ambient variable.
+
 The service comes from `OPTERYX_UPLOAD_URL` and the authenticate service from
 `OPTERYX_AUTH_URL`. Each has a flag if you would rather pass it.
+
+## The GitHub Action
+
+Everything above, as a step. It builds its own throwaway environment, so it
+does not touch the versions your own job depends on, and it authenticates as
+the workflow, so there is no secret in the repository to rotate.
+
+```yaml
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # without this there is no token to present
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mabel-dev/opteryx-upload@v1
+        with:
+          files: data/*.parquet
+          to: acme.security.findings
+```
+
+That is the whole thing for an existing dataset: it supplies its own column
+types, the rows are appended, and the snapshot message says which workflow run
+published them.
+
+A dataset that does not exist yet has its types read from your data, and those
+are never accepted without somebody saying so — there is nobody to ask in a
+workflow, so you say it in advance. Either name the columns, which needs no
+further permission:
+
+```yaml
+      - uses: mabel-dev/opteryx-upload@v1
+        with:
+          files: findings.ndjson
+          to: acme.security.findings
+          declare: |
+            cve_id:VARCHAR
+            published:TIMESTAMP
+            source_ip:IPV4
+```
+
+or decide that inference is good enough here, correcting what it cannot know:
+
+```yaml
+      - uses: mabel-dev/opteryx-upload@v1
+        with:
+          files: |
+            data/**/*.parquet
+            late/*.csv
+          to: acme.security.findings
+          types: |
+            published=TIMESTAMP
+            source_ip=IPV4
+          accept-inferred-types: "true"
+```
+
+`files` is one path or glob per line, because a path may contain a space.
+`data/**/*.parquet` descends.
+
+### Agreeing the contract on the pull request
+
+`plan-only` negotiates against the real destination, writes the table to the
+job summary and abandons the contract. Nothing is uploaded, and the step fails
+if the plan would be refused — so a column that will not cast is a failed check
+on the branch rather than a failed load at 3am.
+
+```yaml
+      - uses: mabel-dev/opteryx-upload@v1
+        with:
+          files: data/*.parquet
+          to: acme.security.findings
+          plan-only: "true"
+```
+
+### Inputs
+
+| | |
+|---|---|
+| `files` | paths or globs, one per line (required) |
+| `to` | `workspace.collection.dataset` (required) |
+| `mode` | `append` or `overwrite`; unset lets the destination imply it |
+| `schema` | `auto`, `infer` or `dataset` |
+| `declare` | `COLUMN:TYPE` per line; mutually exclusive with `schema` |
+| `types` | `COLUMN=TYPE` per line, to correct one inferred type |
+| `ignore` | columns to read and not write, one per line |
+| `accept-inferred-types` | accept types nobody looked at; needed to create a dataset |
+| `plan-only` | negotiate, report, abandon |
+| `message` | snapshot message; defaults to the workflow, commit and run URL |
+| `auth` | `auto`, or `oidc` to demand it |
+| `client-id` / `client-secret` / `token` | for a job that is not using OIDC |
+| `url` / `auth-url` / `audience` | service addresses |
+| `version` | `opteryx-upload` version to install; defaults to the action's own |
+| `python` | interpreter used to build the environment |
+| `summary` | write the plan and result to the job summary (default `true`) |
+
+Credentials travel through the environment and never through the command line,
+so they do not appear in a process list.
+
+### Outputs
+
+| | |
+|---|---|
+| `table` | the dataset that was written |
+| `snapshot` | the published snapshot id |
+| `rows` / `files` | what landed, as the service counted it |
+| `state` | `committed`, `proposed`, `abandoned`, `stale` |
+| `contract-id` | for `opteryx-upload show` |
+| `blocking` | whether an issue stopped the upload |
+| `exit-code` | the client's exit code, as the table above |
+| `result` | the whole contract as JSON |
+
+The exit code is the step's exit code, so a refusal fails the job. Branch on it
+with `continue-on-error: true` and `steps.<id>.outputs.exit-code` — 4 means the
+destination moved and a re-run will work, which is the one worth retrying.
 
 ## The full-screen version
 
@@ -426,6 +550,10 @@ A plain string works too, but a bearer JWT lives about five minutes and an
 upload can take longer than that.
 
 ## Authenticating from GitHub Actions, without a secret
+
+If you only want to upload something from a workflow, use
+[the action](#the-github-action) — it does this for you. What follows is for a
+script of your own.
 
 `GitHubOIDCAuthenticator` is `PATAuthenticator` with nothing stored. GitHub
 mints a short-lived, signed token describing the running workflow, the

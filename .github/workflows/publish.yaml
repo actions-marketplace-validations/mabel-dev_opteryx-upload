@@ -3,7 +3,11 @@ name: publish
 on:
   push:
     tags:
-      - 'v*'
+      # A full version and not `v*`, because the action in this repository is
+      # consumed as `@v1` - a moving major tag. That tag matching this workflow
+      # would mean every action release trying to publish a version PyPI
+      # already has, and failing.
+      - 'v*.*.*'
 
 jobs:
 

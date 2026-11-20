@@ -1,0 +1,267 @@
+name: Opteryx Upload
+description: >-
+  Upload Parquet, Avro, ORC, CSV or NDJSON to Opteryx, agreeing what the data
+  will become before any of it is sent. Authenticates as the workflow itself,
+  with no stored secret.
+author: mabel-dev
+
+branding:
+  icon: upload-cloud
+  color: purple
+
+inputs:
+  # ---- what to upload, and where ----------------------------------------
+  files:
+    description: >-
+      Files to upload, one path or glob per line. Globs are expanded here, so
+      `data/**/*.parquet` works whether or not the shell would have. Newlines
+      and not spaces, because a path may contain one.
+    required: true
+  to:
+    description: "Where the rows go, as workspace.collection.dataset."
+    required: true
+  mode:
+    description: >-
+      `append` to add rows to an existing dataset, `overwrite` to replace what
+      is there. Left unset, an existing dataset appends and a new one is
+      created - which is what nearly every workflow wants, so say nothing
+      unless you mean overwrite.
+    required: false
+    default: ""
+  message:
+    description: >-
+      The snapshot message. Defaults to the workflow name, the commit and a
+      link to the run, because `which run wrote these rows` is the only
+      question anybody asks six months later.
+    required: false
+    default: ""
+
+  # ---- what the columns are ---------------------------------------------
+  schema:
+    description: >-
+      Where the column types come from. `auto` (the default) lets the
+      destination answer it - an existing dataset supplies its own types, a new
+      one has them read from your data. `infer` reads them from the data even
+      if the dataset exists (it must not). `dataset` requires the dataset to
+      exist and uses the types it declares.
+    required: false
+    default: auto
+  declare:
+    description: >-
+      Name every column and its type, one `COLUMN:TYPE` per line. Mutually
+      exclusive with `schema`: declaring the columns IS the schema source, and
+      it is the only option that needs no `accept-inferred-types`.
+    required: false
+    default: ""
+  types:
+    description: >-
+      Correct one inferred type without declaring the rest, one `COLUMN=TYPE`
+      per line - `published=TIMESTAMP`, `source_ip=IPV4`. A CSV cannot say that
+      a column of dotted quads is an address.
+    required: false
+    default: ""
+  ignore:
+    description: "Columns to read and not write, one name per line."
+    required: false
+    default: ""
+  accept-inferred-types:
+    description: >-
+      Accept types that were read from the data with nobody looking at them.
+      Required to create a new dataset from this workflow, and deliberately
+      not the default: once a column of dotted quads is catalogued as VARCHAR,
+      no amount of reading the data back will tell you it was wrong. Declare
+      the columns, or run `plan-only` on a pull request and look, or set this
+      once you have decided inference is good enough here.
+    required: false
+    default: "false"
+
+  # ---- dry run ----------------------------------------------------------
+  plan-only:
+    description: >-
+      Negotiate, print what would happen, and abandon it. Uploads nothing. The
+      step fails if the plan would be refused, which makes this a pull request
+      check: the contract is agreed against the real destination before the
+      merge rather than after it.
+    required: false
+    default: "false"
+
+  # ---- credentials ------------------------------------------------------
+  auth:
+    description: >-
+      `auto` uses an access token if one was given and otherwise authenticates
+      as this workflow over OIDC. `oidc` demands OIDC and fails if the job
+      cannot mint a token, rather than quietly falling back to an ambient
+      variable.
+    required: false
+    default: auto
+  client-id:
+    description: "Access token username. Only needed if you are not using OIDC."
+    required: false
+    default: ""
+  client-secret:
+    description: "The access token itself. Pass a secret, never a literal."
+    required: false
+    default: ""
+  token:
+    description: >-
+      A bearer JWT, if the job already holds one. Lives about five minutes, so
+      an access token or OIDC is nearly always the better answer.
+    required: false
+    default: ""
+  audience:
+    description: "Audience to mint the OIDC token for. Defaults to the authenticate service."
+    required: false
+    default: ""
+  auth-url:
+    description: "Base URL of the authenticate service."
+    required: false
+    default: ""
+  url:
+    description: "Base URL of the upload service."
+    required: false
+    default: ""
+
+  # ---- the action's own plumbing ----------------------------------------
+  version:
+    description: >-
+      Version specifier for the `opteryx-upload` package, e.g. `0.7.0` or
+      `>=0.7,<1`. Defaults to the version this action was released with. Use
+      `local` to install from the checked-out action, which is how this
+      repository tests itself.
+    required: false
+    default: ""
+  python:
+    description: >-
+      The interpreter used to build the isolated environment the client is
+      installed into. Left unset, whichever of `python3` and `python` the
+      runner has is used - the runners disagree about which exists, and the
+      client needs nothing newer than 3.9, so there is rarely a reason to set
+      this.
+    required: false
+    default: ""
+  summary:
+    description: "Write the plan and the result to the job summary."
+    required: false
+    default: "true"
+
+outputs:
+  table:
+    description: "The dataset that was written, as workspace.collection.dataset."
+    value: ${{ steps.upload.outputs.table }}
+  state:
+    description: "The contract's final state: committed, proposed, abandoned, stale."
+    value: ${{ steps.upload.outputs.state }}
+  snapshot:
+    description: "The published snapshot id. Empty unless the upload committed."
+    value: ${{ steps.upload.outputs.snapshot }}
+  rows:
+    description: "Rows written, as the service counted them."
+    value: ${{ steps.upload.outputs.rows }}
+  files:
+    description: "How many files the upload created."
+    value: ${{ steps.upload.outputs.files }}
+  contract-id:
+    description: "The contract id, for `opteryx-upload show`."
+    value: ${{ steps.upload.outputs.contract-id }}
+  blocking:
+    description: "`true` if the contract carried an issue that stops the upload."
+    value: ${{ steps.upload.outputs.blocking }}
+  exit-code:
+    description: >-
+      The client's exit code: 0 committed, 3 refused on its merits, 4 the
+      destination moved (re-run), 5 denied, 6 unreachable.
+    value: ${{ steps.upload.outputs.exit-code }}
+  result:
+    description: "The whole contract as JSON, for anything the other outputs do not cover."
+    value: ${{ steps.upload.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    # Installed into a throwaway environment rather than the job's interpreter.
+    # This action runs inside other people's workflows, next to their own
+    # dependencies, and a client SDK that quietly changes the version of
+    # `requests` their tests run against is a bad guest.
+    - name: install opteryx-upload
+      shell: bash
+      env:
+        OPTERYX_ACTION_VERSION: ${{ inputs.version }}
+        OPTERYX_ACTION_PYTHON: ${{ inputs.python }}
+      run: |
+        set -euo pipefail
+
+        # On Windows these arrive as `D:\a\...`, which bash reads as a word
+        # with escapes in it. Converted once, here, rather than discovered as
+        # a missing directory three lines later.
+        to_unix() {
+          if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s' "$1"; fi
+        }
+        action_path="$(to_unix "${GITHUB_ACTION_PATH}")"
+        temp="$(to_unix "${RUNNER_TEMP}")"
+
+        # The runners disagree about whether `python3` exists, so the name is
+        # resolved once rather than assumed twice.
+        python="${OPTERYX_ACTION_PYTHON}"
+        if [ -z "$python" ]; then
+          if command -v python3 >/dev/null 2>&1; then python=python3; else python=python; fi
+        fi
+
+        venv="$temp/opteryx-upload-action"
+        "$python" -m venv "$venv"
+        # Windows puts the scripts somewhere else; everything after this only
+        # needs to know where they landed.
+        bin="$venv/bin"
+        [ -d "$bin" ] || bin="$venv/Scripts"
+        "$bin/python" -m pip install --quiet --upgrade pip
+
+        if [ "${OPTERYX_ACTION_VERSION}" = "local" ]; then
+          # From the checked-out action, which is how this repository tests
+          # itself. Installed from inside it so the path never has to survive
+          # being a pip requirement specifier.
+          ( cd "$action_path" && "$bin/python" -m pip install --quiet ".[zstd]" )
+        else
+          case "${OPTERYX_ACTION_VERSION}" in
+            "")     spec="opteryx-upload[zstd]>=0.7,<1" ;;
+            [0-9]*) spec="opteryx-upload[zstd]==${OPTERYX_ACTION_VERSION}" ;;
+            *)      spec="opteryx-upload[zstd]${OPTERYX_ACTION_VERSION}" ;;
+          esac
+          "$bin/python" -m pip install --quiet "$spec"
+        fi
+
+        # The wrapper is standard library only, so it runs on the environment
+        # it just built - which is also the one interpreter this action knows
+        # the name of on every runner.
+        {
+          echo "OPTERYX_UPLOAD_EXECUTABLE=$bin/opteryx-upload"
+          echo "OPTERYX_ACTION_INTERPRETER=$bin/python"
+          echo "OPTERYX_ACTION_SCRIPT=$action_path/action/main.py"
+        } >> "$GITHUB_ENV"
+        "$bin/opteryx-upload" --version
+
+    - name: upload
+      id: upload
+      shell: bash
+      env:
+        INPUT_FILES: ${{ inputs.files }}
+        INPUT_TO: ${{ inputs.to }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_MESSAGE: ${{ inputs.message }}
+        INPUT_SCHEMA: ${{ inputs.schema }}
+        INPUT_DECLARE: ${{ inputs.declare }}
+        INPUT_TYPES: ${{ inputs.types }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+        INPUT_ACCEPT_INFERRED_TYPES: ${{ inputs.accept-inferred-types }}
+        INPUT_PLAN_ONLY: ${{ inputs.plan-only }}
+        INPUT_AUTH: ${{ inputs.auth }}
+        INPUT_CLIENT_ID: ${{ inputs.client-id }}
+        INPUT_CLIENT_SECRET: ${{ inputs.client-secret }}
+        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+        INPUT_AUTH_URL: ${{ inputs.auth-url }}
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+      # Both of these were resolved and exported by the step above. Through the
+      # environment rather than interpolated into the script, so an input is a
+      # value and never a second command.
+      run: >-
+        "$OPTERYX_ACTION_INTERPRETER" "$OPTERYX_ACTION_SCRIPT"

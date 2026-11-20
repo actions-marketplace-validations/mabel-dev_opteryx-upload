@@ -587,3 +587,166 @@ class TestProgress:
 
         with open(path, "rb") as handle:
             assert _CountingReader(handle, len(CSV), explode).read() == CSV
+
+
+class TestAuthenticatingAsTheWorkflow:
+    """In Actions there is a credential nobody has to store, so it is preferred.
+
+    The ordering is the whole test. Something explicitly configured has to win -
+    a job that set `OPTERYX_TOKEN` on purpose and silently authenticated as
+    itself instead would be impossible to debug - and with nothing configured
+    the federated token is the only sensible answer, because the alternative is
+    a secret in a repository.
+    """
+
+    @pytest.fixture
+    def in_actions(self, monkeypatch):
+        monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://token.test/actions")
+        monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token")
+        for name in (config.ENV_TOKEN, config.ENV_CLIENT_ID, config.ENV_CLIENT_SECRET):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.fixture
+    def not_in_actions(self, monkeypatch):
+        monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_URL", raising=False)
+        monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", raising=False)
+
+    def test_with_nothing_configured_the_job_authenticates_as_itself(self, in_actions):
+        from opteryx_upload.auth import GitHubOIDCAuthenticator
+
+        assert isinstance(config.build_client()._token, GitHubOIDCAuthenticator)
+
+    def test_an_access_token_still_wins_because_somebody_chose_it(self, in_actions, monkeypatch):
+        from opteryx_upload.auth import PATAuthenticator
+
+        monkeypatch.setenv(config.ENV_CLIENT_ID, "id")
+        monkeypatch.setenv(config.ENV_CLIENT_SECRET, "secret")
+        assert isinstance(config.build_client()._token, PATAuthenticator)
+
+    def test_an_ambient_jwt_still_wins_too(self, in_actions, monkeypatch):
+        monkeypatch.setenv(config.ENV_TOKEN, "jwt")
+        assert config.build_client()._token == "jwt"
+
+    def test_asking_for_it_by_name_overrides_everything(self, in_actions, monkeypatch):
+        from opteryx_upload.auth import GitHubOIDCAuthenticator
+
+        monkeypatch.setenv(config.ENV_TOKEN, "jwt")
+        monkeypatch.setenv(config.ENV_CLIENT_ID, "id")
+        monkeypatch.setenv(config.ENV_CLIENT_SECRET, "secret")
+        assert isinstance(config.build_client(oidc=True)._token, GitHubOIDCAuthenticator)
+
+    def test_asking_for_it_where_it_cannot_work_names_the_permission(self, not_in_actions):
+        with pytest.raises(config.ConfigError) as raised:
+            config.build_client(oidc=True)
+        assert "id-token: write" in str(raised.value)
+
+    def test_the_audience_comes_from_the_environment_when_it_is_set(
+        self, in_actions, monkeypatch
+    ):
+        monkeypatch.setenv(config.ENV_OIDC_AUDIENCE, "https://aud.test")
+        assert config.build_client(oidc=True)._token._audience == "https://aud.test"
+
+    def test_no_credentials_anywhere_mentions_the_option_with_no_secret(self, not_in_actions, monkeypatch):
+        for name in (config.ENV_TOKEN, config.ENV_CLIENT_ID, config.ENV_CLIENT_SECRET):
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(config.ConfigError) as raised:
+            config.build_client()
+        assert "id-token: write" in str(raised.value)
+
+
+class TestOutputJson:
+    """A pipeline wants a payload it can branch on and a log a person can read.
+
+    `--json` makes them the same thing, and CI picks the machine every time -
+    which is how you get a failed nightly upload whose log is a wall of JSON.
+    """
+
+    @responses.activate
+    def test_a_plan_is_written_where_it_was_asked_for(self, env, csv_file, tmp_path):
+        responses.add(responses.POST, f"{BASE_URL}/v2/contracts", json=body(), status=201)
+        responses.add(responses.DELETE, f"{BASE_URL}/v2/contracts/ct_1", status=204)
+        where = tmp_path / "contract.json"
+        code, out, _ = run(
+            ["plan", csv_file, "--to", "acme.security.findings", "--no-color",
+             "--output-json", str(where)]
+        )
+        assert code == config.OK
+        assert json.loads(where.read_text())["contract_id"] == "ct_1"
+        # and the readable output is still there
+        assert "acme.security.findings" in out
+
+    @responses.activate
+    def test_a_commit_is_written_with_the_snapshot_on_it(self, env, csv_file, tmp_path):
+        committed = body("committed", snapshot="snap_1", rows_written=2,
+                         writes=[{"source": "findings.csv", "rows": 2, "bytes": 1, "object": "o"}])
+        responses.add(responses.POST, f"{BASE_URL}/v2/contracts", json=body(), status=201)
+        responses.add(
+            responses.POST,
+            f"{BASE_URL}/v2/contracts/ct_1/data",
+            json=body("writing", rows_written=2),
+            status=200,
+        )
+        responses.add(
+            responses.POST, f"{BASE_URL}/v2/contracts/ct_1/commit", json=committed, status=200
+        )
+        where = tmp_path / "contract.json"
+        code, _out, _err = run(
+            ["push", csv_file, "--to", "acme.security.findings", "--no-color", "-y",
+             "--output-json", str(where)]
+        )
+        assert code == config.OK
+        written = json.loads(where.read_text())
+        assert written["snapshot"] == "snap_1"
+        assert written["state"] == "committed"
+
+    @responses.activate
+    def test_a_refusal_is_written_too_so_the_summary_can_say_why(
+        self, env, csv_file, tmp_path
+    ):
+        responses.add(
+            responses.POST,
+            f"{BASE_URL}/v2/contracts",
+            json=body(issues=[{"code": "column_undeclared", "column": "extra",
+                               "detail": "'extra' is not declared", "severity": "blocking"}]),
+            status=201,
+        )
+        responses.add(responses.DELETE, f"{BASE_URL}/v2/contracts/ct_1", status=204)
+        where = tmp_path / "contract.json"
+        code, _out, _err = run(
+            ["push", csv_file, "--to", "acme.security.findings", "--no-color", "-y",
+             "--output-json", str(where)]
+        )
+        assert code == config.REFUSED
+        assert json.loads(where.read_text())["issues"][0]["column"] == "extra"
+
+    @responses.activate
+    def test_an_unwritable_path_does_not_undo_a_commit(self, env, csv_file, tmp_path, capsys):
+        # The rows are published by the time this is written. Failing the job
+        # over a file handle would be a lie about what is in the catalog.
+        responses.add(responses.POST, f"{BASE_URL}/v2/contracts", json=body(), status=201)
+        responses.add(
+            responses.POST, f"{BASE_URL}/v2/contracts/ct_1/data",
+            json=body("writing", rows_written=2), status=200
+        )
+        responses.add(
+            responses.POST, f"{BASE_URL}/v2/contracts/ct_1/commit",
+            json=body("committed", snapshot="snap_1"), status=200
+        )
+        code, _out, _err = run(
+            ["push", csv_file, "--to", "acme.security.findings", "--no-color", "-y",
+             "--output-json", str(tmp_path / "missing" / "dir" / "c.json")]
+        )
+        assert code == config.OK
+        assert "could not write" in capsys.readouterr().err
+
+
+class TestRecursiveGlobs:
+    def test_a_double_star_descends(self, tmp_path):
+        # `data/**/*.parquet` is what a workflow writes, and without
+        # `recursive=True` it quietly means the same as a single star.
+        nested = tmp_path / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "deep.csv").write_bytes(CSV)
+        (tmp_path / "a" / "shallow.csv").write_bytes(CSV)
+        found = cli.resolve_files([str(tmp_path / "**" / "*.csv")])
+        assert len(found) == 2

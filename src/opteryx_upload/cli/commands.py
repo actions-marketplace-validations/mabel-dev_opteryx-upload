@@ -63,7 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
             "--client-secret", help=f"access token (${config.ENV_CLIENT_SECRET})"
         )
         sub.add_argument("--token", help=f"a bearer JWT (${config.ENV_TOKEN})")
+        sub.add_argument(
+            "--oidc",
+            action="store_true",
+            help="authenticate as this GitHub Actions workflow; no secret needed",
+        )
         sub.add_argument("--json", action="store_true", help="print the contract as JSON")
+        sub.add_argument(
+            "--output-json",
+            metavar="PATH",
+            help="also write the contract as JSON here, keeping the readable output",
+        )
         sub.add_argument(
             "--no-color", action="store_true", help="never colour the output"
         )
@@ -190,7 +200,7 @@ def resolve_files(patterns: Sequence[str]) -> List[str]:
         if os.path.isfile(pattern):
             found.append(pattern)
             continue
-        matches = sorted(globbing.glob(pattern))
+        matches = sorted(globbing.glob(pattern, recursive=True))
         if not matches:
             raise config.ConfigError(f"no such file: {pattern}")
         found.extend(match for match in matches if os.path.isfile(match))
@@ -219,6 +229,30 @@ def schema_for(args) -> Schema:
 # ---------------------------------------------------------------------------
 
 
+def _emit_output_json(args, contract) -> None:
+    """Write the contract to `--output-json`, for whatever runs after this.
+
+    Separate from `--json` on purpose. A pipeline wants both: a log a person can
+    read when it goes wrong, and a payload it can branch on. Making them the
+    same flag means picking one, and CI picks the machine every time - which is
+    how you end up with a failed nightly upload whose log is a wall of JSON.
+
+    A path that cannot be written is a problem with the pipeline, not with the
+    upload, and the upload has already happened by the time we get here. So it
+    is reported and not raised: losing the summary must not turn a committed
+    snapshot into a failed job.
+    """
+    path = getattr(args, "output_json", None)
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(render.as_json(contract), handle, indent=2)
+            handle.write("\n")
+    except OSError as error:
+        print(f"{PROGRAM}: could not write --output-json: {error}", file=sys.stderr)
+
+
 def command_plan(args, out, err) -> int:
     """Negotiate, print, abandon. Uploads nothing and leaves nothing behind."""
     style = Style(False if args.no_color or args.json else None, out)
@@ -228,6 +262,7 @@ def command_plan(args, out, err) -> int:
         token=args.token,
         client_id=args.client_id,
         client_secret=args.client_secret,
+        oidc=args.oidc,
     )
     contract = client.negotiate(
         parse_target(args.to), files, schema_for(args), ignore=args.ignore or None
@@ -235,6 +270,7 @@ def command_plan(args, out, err) -> int:
     try:
         if args.retype:
             contract.retype(**parse_pairs(args.retype, "=", "--type"))
+        _emit_output_json(args, contract)
         if args.json:
             json.dump(render.as_json(contract), out, indent=2)
             out.write("\n")
@@ -264,6 +300,7 @@ def command_push(args, out, err) -> int:
         token=args.token,
         client_id=args.client_id,
         client_secret=args.client_secret,
+        oidc=args.oidc,
     )
 
     if not args.json:
@@ -292,6 +329,7 @@ def command_push(args, out, err) -> int:
 
         if contract.blocking:
             print(style.red("  this upload cannot proceed"), file=err)
+            _emit_output_json(args, contract)
             _abandon_quietly(contract)
             return config.REFUSED
 
@@ -310,6 +348,7 @@ def command_push(args, out, err) -> int:
     except BaseException:
         _abandon_quietly(contract)
         raise
+    _emit_output_json(args, contract)
     if args.json:
         json.dump(render.as_json(contract), out, indent=2)
         out.write("\n")
@@ -346,6 +385,7 @@ def command_show(args, out, err) -> int:
         token=args.token,
         client_id=args.client_id,
         client_secret=args.client_secret,
+        oidc=args.oidc,
     )
     contract = client.contract(args.contract_id)
     if args.json:
@@ -373,6 +413,7 @@ def command_abandon(args, out, err) -> int:
         token=args.token,
         client_id=args.client_id,
         client_secret=args.client_secret,
+        oidc=args.oidc,
     )
     client.contract(args.contract_id).abandon()
     print(f"  abandoned {args.contract_id}", file=out)

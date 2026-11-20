@@ -1,0 +1,91 @@
+name: action
+
+# The action is the thing other people depend on, and nothing in the unit tests
+# covers the half of it that is YAML: the inputs reaching the script, the
+# throwaway environment being built, the client being on the path afterwards.
+# So it is run here, against an address nothing is listening on.
+#
+# What this proves is the wiring. The upload itself is covered by the client's
+# own tests, which is why pointing it at a closed port is enough: exit code 6
+# means the arguments were built, the client was installed and it got as far as
+# trying to reach a service.
+
+on:
+  push:
+    paths:
+      - action.yml
+      - action/**
+      - .github/workflows/action.yaml
+      - src/**
+  pull_request:
+    paths:
+      - action.yml
+      - action/**
+      - .github/workflows/action.yaml
+      - src/**
+
+jobs:
+  wiring:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: a file to negotiate about
+        shell: bash
+        run: |
+          printf 'cve_id,published,source_ip\n' > findings.csv
+          printf 'CVE-1,2026-08-01T04:22:07Z,10.4.19.7\n' >> findings.csv
+
+      - name: plan against an address nothing answers on
+        id: upload
+        continue-on-error: true
+        uses: ./
+        with:
+          version: local
+          files: findings.csv
+          to: acme.security.findings
+          plan-only: "true"
+          url: http://127.0.0.1:1
+          token: not-a-real-token
+          summary: "false"
+
+      - name: it got as far as the service and said so
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.upload.outputs.exit-code }}
+        run: |
+          echo "exit-code: ${EXIT_CODE}"
+          # 6 is "the service could not be reached". Anything else means the
+          # wiring broke before the request: 2 is a bad argument, 5 would mean
+          # it never looked at the URL at all.
+          [ "${EXIT_CODE}" = "6" ]
+
+  misconfiguration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: an input that contradicts itself is refused as a usage error
+        id: upload
+        continue-on-error: true
+        uses: ./
+        with:
+          version: local
+          files: findings.csv
+          to: acme.security.findings
+          schema: infer
+          declare: "cve_id:VARCHAR"
+          summary: "false"
+
+      - name: and it says so as a usage error
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.upload.outputs.exit-code }}
+        run: |
+          echo "exit-code: ${EXIT_CODE}"
+          [ "${EXIT_CODE}" = "2" ]

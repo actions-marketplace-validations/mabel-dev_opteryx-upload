@@ -12,6 +12,8 @@ import os
 from typing import Optional
 
 from ..auth import DEFAULT_AUTH_URL
+from ..auth import DEFAULT_OIDC_AUDIENCE
+from ..auth import GitHubOIDCAuthenticator
 from ..auth import PATAuthenticator
 from ..client import DEFAULT_BASE_URL
 from ..client import ContractClient
@@ -69,6 +71,7 @@ ENV_TOKEN = "OPTERYX_TOKEN"
 ENV_CLIENT_ID = "OPTERYX_CLIENT_ID"
 ENV_CLIENT_SECRET = "OPTERYX_CLIENT_SECRET"
 ENV_AUTH_URL = "OPTERYX_AUTH_URL"
+ENV_OIDC_AUDIENCE = "OPTERYX_OIDC_AUDIENCE"
 
 
 class ConfigError(Exception):
@@ -85,6 +88,7 @@ def build_client(
     token: Optional[str] = None,
     client_id: Optional[str] = None,
     client_secret: Optional[str] = None,
+    oidc: bool = False,
     timeout: float = 300.0,
 ) -> ContractClient:
     """A client, or a `ConfigError` naming the variable that would fix it.
@@ -101,26 +105,47 @@ def build_client(
     Neither is read from a file: a token on disk is a token in a backup, and the
     shells and CI systems that run this all have a way to hold a secret that is
     not a file in the repository.
+
+    In GitHub Actions with `id-token: write` there is a fourth option and it is
+    the best one, because there is no secret to hold at all: the job asks GitHub
+    for a signed token saying which workflow it is. That is used automatically
+    when nothing else was configured, and `oidc=True` demands it - a workflow
+    that meant to authenticate as itself and silently fell back to an ambient
+    variable would be a surprise worth an error.
     """
     explicit_token = token
     token = token or os.environ.get(ENV_TOKEN)
     client_id = client_id or os.environ.get(ENV_CLIENT_ID)
     client_secret = client_secret or os.environ.get(ENV_CLIENT_SECRET)
+    audience = os.environ.get(ENV_OIDC_AUDIENCE) or DEFAULT_OIDC_AUDIENCE
+    auth_url = os.environ.get(ENV_AUTH_URL) or DEFAULT_AUTH_URL
 
-    if client_id and client_secret and not explicit_token:
-        credential: TokenLike = PATAuthenticator(
+    if oidc:
+        if not GitHubOIDCAuthenticator.is_available():
+            raise ConfigError(
+                "--oidc needs GitHub Actions to mint a token, and this job cannot: "
+                "ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN are "
+                "not set. Add `permissions: id-token: write` to the job."
+            )
+        credential: TokenLike = GitHubOIDCAuthenticator(audience=audience, auth_url=auth_url)
+    elif client_id and client_secret and not explicit_token:
+        credential = PATAuthenticator(
             client_id=client_id,
             client_secret=client_secret,
-            auth_url=os.environ.get(ENV_AUTH_URL) or DEFAULT_AUTH_URL,
+            auth_url=auth_url,
         )
     elif token:
         credential = token
     elif client_id or client_secret:
         missing = ENV_CLIENT_SECRET if client_id else ENV_CLIENT_ID
         raise ConfigError(f"an access token needs a username too; {missing} is not set")
+    elif GitHubOIDCAuthenticator.is_available():
+        # Nothing was configured and we are in a job that can prove who it is.
+        credential = GitHubOIDCAuthenticator(audience=audience, auth_url=auth_url)
     else:
         raise ConfigError(
-            f"no credentials: set {ENV_CLIENT_ID} and {ENV_CLIENT_SECRET}, or {ENV_TOKEN}"
+            f"no credentials: set {ENV_CLIENT_ID} and {ENV_CLIENT_SECRET}, or {ENV_TOKEN}, "
+            "or run in GitHub Actions with `permissions: id-token: write`"
         )
 
     return ContractClient(token=credential, base_url=base_url(url), timeout=timeout)
