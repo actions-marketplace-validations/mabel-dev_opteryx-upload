@@ -394,6 +394,8 @@ class TestEndToEnd:
         monkeypatch.setenv("INPUT_SCHEMA", "guess")
         assert runner() == 2
         assert not os.path.exists(os.environ["FAKE_ARGV"])
+        # The step that checks the exit code reads it from the outputs, not the process.
+        assert "exit-code<<__OPTERYX_EOF__\n2" in runner.output.read_text()
 
     def test_the_summary_can_be_turned_off(self, runner):
         runner(summary="false")

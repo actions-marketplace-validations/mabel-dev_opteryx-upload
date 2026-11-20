@@ -364,6 +364,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         command = build_argv(env, executable, result_path)
     except InputError as error:
         print(f"::error::{error}")
+        # Outputs are written here too, so a caller with continue-on-error can see the 2.
+        write_outputs(outputs_for(None, 2), env.get("GITHUB_OUTPUT"))
         return 2
 
     child_env = dict(env)
