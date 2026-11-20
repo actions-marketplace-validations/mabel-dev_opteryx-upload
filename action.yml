@@ -1,8 +1,10 @@
 name: Opteryx Upload
+# The Marketplace refuses anything over 125 characters, so this says the three
+# things that distinguish it - the formats, the contract, the absent secret -
+# and leaves the rest to the README.
 description: >-
   Upload Parquet, Avro, ORC, CSV or NDJSON to Opteryx, agreeing what the data
-  will become before any of it is sent. Authenticates as the workflow itself,
-  with no stored secret.
+  will become first. No stored secret.
 author: mabel-dev
 
 branding:
